@@ -1,0 +1,8 @@
+RYU Dual Touch Virtual HID P1 -- OFFLINE VALIDATION
+Status: SOURCE READY FOR ON-DEVICE BUILD / NOT VERIFIED ON REAL IPHONE.
+Device: NOT CONNECTED. Build environment: Linux x64 without iOS SDK.
+PASSED: 7 Python unittest cases, including simulated TCP handshake, authorization rejection, DOWN->MOVE->UP ordered transport, 1.35-second held touch heartbeat, portrait/landscape coordinate mapping.
+PASSED: C host test verifying HID descriptor initial bytes, 32-byte wire report, two independent VIRTUAL fingers, targeted UP preserves other VIRTUAL contacts, state/coordinate guards, reset.
+PASSED: C source syntax check of iOS native daemon using stub CoreFoundation declarations (NOT a real iOS link/build).
+NOT TESTED: Theos iOS arm64 build/link, entitlement acceptance, registration by iOS 17.5, actual UI tap, simultaneous REAL+VIRTUAL iPhone gestures, FPS and latency.
+WARNING: A successful report send does not prove the iPhone generated an actual touch or protected the physical finger.

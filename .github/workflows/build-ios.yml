@@ -1,0 +1,31 @@
+name: Build RYU iOS rootless virtual HID research tool
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ios.yml'
+jobs:
+  ios-deb:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install prerequisites
+        run: |
+          brew install ldid dpkg make
+          git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+      - name: Build rootless DEB (not runtime validated)
+        env:
+          THEOS: ${{ github.workspace }}/.theos-placeholder
+        run: |
+          export THEOS="$HOME/theos"
+          cd ios
+          make package FINALPACKAGE=1
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: RYU-iOS-rootless-P1-unverified
+          path: ios/packages/*.deb
+          if-no-files-found: error
