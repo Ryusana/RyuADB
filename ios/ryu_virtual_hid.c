@@ -21,6 +21,14 @@
 #include "ryu_hid_report.h"
 
 #define RYU_PORT 6017
+#define RYU_BUILD_STAMP "P1.1-HID-DIAG-20261120"
+// Deliberately harmless, vendor-defined HID descriptor used to isolate
+// a registration/permission problem from a touchscreen descriptor problem.
+static const uint8_t RYU_BASIC_DESCRIPTOR[] = {
+  0x06,0x00,0xff, 0x09,0x01, 0xa1,0x01,
+  0x15,0x00, 0x26,0xff,0x00, 0x75,0x08,0x95,0x01,
+  0x09,0x01,0x81,0x02,0xc0
+};
 static volatile sig_atomic_t running=1;
 static pthread_mutex_t report_lock=PTHREAD_MUTEX_INITIALIZER;
 static RyuReport current;
@@ -40,7 +48,7 @@ static void add_str(CFMutableDictionaryRef d,const char *key,const char *value) 
   CFStringRef v=CFStringCreateWithCString(kCFAllocatorDefault,value,kCFStringEncodingUTF8);
   CFDictionarySetValue(d,k,v); CFRelease(k); CFRelease(v);
 }
-static int load_hid(void) {
+static int load_hid(int basic) {
   iokit_handle=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW);
   if(!iokit_handle){fprintf(stderr,"ERR iokit_dl_open: %s\n",dlerror());return -1;}
   pCreate=(void*(*)(CFAllocatorRef,CFDictionaryRef))dlsym(iokit_handle,"IOHIDUserDeviceCreate");
@@ -48,19 +56,30 @@ static int load_hid(void) {
   pHandle=(int(*)(void*,uint8_t*,CFIndex))dlsym(iokit_handle,"IOHIDUserDeviceHandleReport");
   if(!pCreate || !pSchedule || !pHandle){fprintf(stderr,"ERR missing IOHIDUserDevice symbol\n");return -2;}
   CFMutableDictionaryRef dict=CFDictionaryCreateMutable(kCFAllocatorDefault,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
-  CFDataRef desc=CFDataCreate(kCFAllocatorDefault,RYU_HID_DESCRIPTOR,(CFIndex)sizeof(RYU_HID_DESCRIPTOR));
+  const uint8_t *descriptor=basic?RYU_BASIC_DESCRIPTOR:RYU_HID_DESCRIPTOR;
+  size_t descriptor_size=basic?sizeof(RYU_BASIC_DESCRIPTOR):sizeof(RYU_HID_DESCRIPTOR);
+  fprintf(stderr,"HID_PROBE_BEGIN build=%s kind=%s uid=%ld euid=%ld descriptor_bytes=%zu\n",
+    RYU_BUILD_STAMP,basic?"vendor-basic":"touchscreen",(long)getuid(),(long)geteuid(),descriptor_size);
+  CFDataRef desc=CFDataCreate(kCFAllocatorDefault,descriptor,(CFIndex)descriptor_size);
   CFDictionarySetValue(dict,CFSTR("ReportDescriptor"),desc);
-  add_str(dict,"Product","RYU Virtual Touchscreen P1");
+  add_str(dict,"Product",basic?"RYU Virtual HID Registration Probe":"RYU Virtual Touchscreen P1");
   add_str(dict,"Manufacturer","RYU Research");
   add_str(dict,"Transport","Virtual");
   add_num(dict,"VendorID",0x1212); add_num(dict,"ProductID",0x1717);
-  add_num(dict,"PrimaryUsagePage",0x0d); add_num(dict,"PrimaryUsage",0x04);
+  add_num(dict,"PrimaryUsagePage",basic?0xff00:0x0d); add_num(dict,"PrimaryUsage",basic?0x01:0x04);
   add_num(dict,"ReportInterval",8000); // request up to 125Hz; actual rate is input-driven
+  errno=0;
   user_device=pCreate(kCFAllocatorDefault,dict);
+  int create_errno=errno;
   CFRelease(desc); CFRelease(dict);
-  if(!user_device){ fprintf(stderr,"ERR virtual HID creation rejected (check jailbreak entitlements/iOS support)\n"); return -3; }
+  if(!user_device){
+    fprintf(stderr,"HID_PROBE_FAIL kind=%s uid=%ld euid=%ld errno=%d (errno is NOT a reliable CoreFoundation error code)\n",
+      basic?"vendor-basic":"touchscreen",(long)getuid(),(long)geteuid(),create_errno);
+    fprintf(stderr,"ERR IOHIDUserDeviceCreate returned NULL; verify effective signature/permissions and OS support.\n");
+    return -3;
+  }
   pSchedule(user_device,CFRunLoopGetMain(),kCFRunLoopDefaultMode);
-  printf("HID_DEVICE_CREATED (kernel accepted registration; NOT proof of effective touch)\n");
+  printf("HID_DEVICE_CREATED kind=%s (registration only; NOT proof of effective touch)\n",basic?"vendor-basic":"touchscreen");
   return 0;
 }
 static void all_virtual_up(void) {
@@ -113,20 +132,31 @@ static void *server(void *p) {
 int main(int argc, char **argv){
  setvbuf(stdout,NULL,_IONBF,0);
  printf("RYU Virtual HID P1 / iOS 17.5 experimental / foreground only\n");
+ printf("BUILD_STAMP=%s\n", RYU_BUILD_STAMP);
  printf("WARNING: test on a non-critical screen; no claim of physical-finger independence yet.\n");
  signal(SIGPIPE,SIG_IGN);
  // SIGINT/SIGTERM default action terminates the user device and releases ONLY its contacts.
  uint8_t bytes[16]; arc4random_buf(bytes,sizeof(bytes));
  for(int i=0;i<16;i++)sprintf(secret+i*2,"%02x",bytes[i]);secret[32]=0;
  ryu_report_init(&current);
+ if(argc>1 && strcmp(argv[1],"--version")==0) {
+   puts("VERSION_OK; no HID registration attempted");
+   return 0;
+ }
  if(argc>1 && strcmp(argv[1],"--report-test")==0){
    int rc=ryu_report_set(&current,0,1,200,300);
    printf("REPORT_TEST count=%u bytes=%zu rc=%d (no actual HID device created)\n",current.count,sizeof(current),rc);
    return rc==0?0:1;
  }
- if(load_hid()!=0)return 2;
- if(argc>1 && strcmp(argv[1],"--probe")==0){
-   printf("PROBE_CREATED. Does not prove UIKit touch input.\n");
+ int basic_probe=argc>1 && strcmp(argv[1],"--probe-basic")==0;
+ int touch_probe=argc>1 && strcmp(argv[1],"--probe")==0;
+ if(argc>1 && !basic_probe && !touch_probe) {
+   fprintf(stderr,"ERR unknown option: %s\n",argv[1]);
+   return 4;
+ }
+ if(load_hid(basic_probe)!=0)return 2;
+ if(basic_probe || touch_probe){
+   printf("PROBE_CREATED kind=%s. No HID input report sent; does not prove UIKit touch input.\n",basic_probe?"vendor-basic":"touchscreen");
    if(user_device)CFRelease(user_device);
    return 0;
  }
