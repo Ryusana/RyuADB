@@ -1,28 +1,42 @@
 name: Build RYU iOS rootless virtual HID research tool
+
 on:
   workflow_dispatch:
   push:
     paths:
       - 'ios/**'
       - '.github/workflows/build-ios.yml'
+
 jobs:
   ios-deb:
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install prerequisites
+
+      - name: Install prerequisites and Theos
+        shell: bash
         run: |
+          set -euo pipefail
           brew install ldid dpkg make
-          git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$HOME/theos"
+          test -f "$HOME/theos/makefiles/common.mk"
+          # The macOS GitHub runner already includes Xcode and its iPhoneOS SDK.
+          # Theos creates its own sdks/ directory. Do NOT git-clone into it.
+          echo 'Using Xcode iPhoneOS SDK:'
+          xcrun --sdk iphoneos --show-sdk-path
+          echo 'GNU Make:'
+          gmake --version | head -n 1
+
       - name: Build rootless DEB (not runtime validated)
-        env:
-          THEOS: ${{ github.workspace }}/.theos-placeholder
+        shell: bash
         run: |
+          set -euo pipefail
           export THEOS="$HOME/theos"
-          cd ios
-          make package FINALPACKAGE=1
+          gmake -C ios package FINALPACKAGE=1
+          ls -lh ios/packages/*.deb
+
       - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
