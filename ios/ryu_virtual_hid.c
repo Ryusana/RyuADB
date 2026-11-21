@@ -8,6 +8,8 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -22,7 +24,7 @@
 #include "ryu_hid_report.h"
 
 #define RYU_PORT 6017
-#define RYU_BUILD_STAMP "P1.4-ALT-HID-EVENT-PATH-20261121"
+#define RYU_BUILD_STAMP "P1.5-EVENT-ONE-TAP-20261121"
 // Deliberately harmless, vendor-defined HID descriptor used to isolate
 // a registration/permission problem from a touchscreen descriptor problem.
 static const uint8_t RYU_BASIC_DESCRIPTOR[] = {
@@ -226,6 +228,81 @@ static int audit_alternative_event_path(void) {
   return 0;
 }
 
+
+// V11: SINGLE opt-in event-system dispatch test. NEVER reuses the physical
+// touchscreen's sender ID. Successful function calls do NOT prove UIKit
+// received the event. This sends one down and one up, NO swipes or holds.
+// Coordinates are normalized [0..1] in portrait display orientation.
+static int event_test_one_tap(double x, double y) {
+  if(!isfinite(x)||!isfinite(y)||x<0.05||x>0.95||y<0.05||y>0.95){
+    puts("EVENT_TAP_REFUSED=INVALID_COORDINATES (allowed 0.05..0.95)");
+    return 12;
+  }
+  void *h=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
+  if(!h){puts("EVENT_TAP_REFUSED=IOKIT_LOAD_FAILED");return 12;}
+  typedef CFTypeRef (*CreateClientFn)(CFAllocatorRef);
+  typedef CFTypeRef (*CreateHandFn)(CFAllocatorRef,uint64_t,uint32_t,uint32_t,uint32_t,
+                                    uint32_t,uint32_t,double,double,double,double,double,
+                                    unsigned char,unsigned char,uint32_t);
+  typedef CFTypeRef (*CreateFingerFn)(CFAllocatorRef,uint64_t,uint32_t,uint32_t,uint32_t,
+                                      double,double,double,double,double,unsigned char,unsigned char,uint32_t);
+  CreateClientFn create_client=(CreateClientFn)dlsym(h,"IOHIDEventSystemClientCreate");
+  CreateHandFn create_hand=(CreateHandFn)dlsym(h,"IOHIDEventCreateDigitizerEvent");
+  CreateFingerFn create_finger=(CreateFingerFn)dlsym(h,"IOHIDEventCreateDigitizerFingerEvent");
+  void (*append_event)(CFTypeRef,CFTypeRef,uint32_t)=(void(*)(CFTypeRef,CFTypeRef,uint32_t))
+                  dlsym(h,"IOHIDEventAppendEvent");
+  void (*set_sender)(CFTypeRef,uint64_t)=(void(*)(CFTypeRef,uint64_t))
+                  dlsym(h,"IOHIDEventSetSenderID");
+  void (*set_integer)(CFTypeRef,uint32_t,CFIndex)=(void(*)(CFTypeRef,uint32_t,CFIndex))
+                  dlsym(h,"IOHIDEventSetIntegerValue");
+  void (*dispatch_event)(CFTypeRef,CFTypeRef)=(void(*)(CFTypeRef,CFTypeRef))
+                  dlsym(h,"IOHIDEventSystemClientDispatchEvent");
+  if(!create_client||!create_hand||!create_finger||!append_event||!set_sender||
+     !set_integer||!dispatch_event){
+    puts("EVENT_TAP_REFUSED=MISSING_REQUIRED_SYMBOL");dlclose(h);return 12;
+  }
+  CFTypeRef client=create_client(kCFAllocatorDefault);
+  if(!client){puts("EVENT_TAP_REFUSED=CLIENT_CREATE_NULL");dlclose(h);return 12;}
+  // A distinct virtual sender identity; intentionally NOT the built-in
+  // digitizer senderID. Two packets (DOWN/UP) share this identity.
+  const uint64_t sender_id=UINT64_C(0x5259555445535431); // ASCII RYUTEST1
+  const uint32_t mask_down=0x07u; // Range | Touch | Position
+  const uint32_t mask_up=0x03u;   // Range | Touch changed
+  const uint32_t hand_type=3u;
+  const uint32_t display_integrated=((uint32_t)11<<16)+25u;
+  puts("EVENT_TAP_BEGIN=ONE_SHOT; no repeated events; unique sender; no physical finger expected");
+  printf("EVENT_TAP_POSITION_NORMALIZED=%.5f,%.5f\n",x,y);
+  fflush(stdout);
+  int result=0;
+  for(int down=1;down>=0;--down){
+    uint64_t timestamp=mach_absolute_time();
+    uint32_t mask=down?mask_down:mask_up;
+    CFTypeRef hand=create_hand(kCFAllocatorDefault,timestamp,hand_type,0,0,mask,0,
+                              x,y,0.0,0.0,0.0,(unsigned char)down,(unsigned char)down,0);
+    CFTypeRef finger=create_finger(kCFAllocatorDefault,timestamp,1,2,mask,
+                                 x,y,0.0,0.0,0.0,(unsigned char)down,(unsigned char)down,0);
+    if(!hand || !finger){
+      if(hand)CFRelease(hand);
+      if(finger)CFRelease(finger);
+      puts("EVENT_TAP_REFUSED=EVENT_CREATE_NULL");result=13;break;
+    }
+    set_integer(hand,display_integrated,1);
+    set_integer(finger,display_integrated,1);
+    set_sender(hand,sender_id);
+    set_sender(finger,sender_id);
+    append_event(hand,finger,0);
+    dispatch_event(client,hand);
+    printf("EVENT_TAP_STAGE=%s; dispatch_called=YES; callback_ack=UNAVAILABLE\n",down?"DOWN":"UP");
+    fflush(stdout);
+    CFRelease(finger);
+    CFRelease(hand);
+    if(down) usleep(75000); // single tap dwell; no repeated frame events
+  }
+  if(!result)puts("EVENT_TAP_RESULT=DISPATCH_API_CALLED; screen_delivery=UNVERIFIED; independent_fingers=UNTESTED");
+  CFRelease(client);dlclose(h);
+  return result;
+}
+
 static int load_hid(int basic) {
   iokit_handle=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW);
   if(!iokit_handle){fprintf(stderr,"ERR iokit_dl_open: %s\n",dlerror());return -1;}
@@ -319,6 +396,16 @@ int main(int argc, char **argv){
  ryu_report_init(&current);
  if(argc>1 && strcmp(argv[1],"--audit-kernel")==0) return audit_kernel_registration();
  if(argc>1 && strcmp(argv[1],"--audit-event-path")==0) return audit_alternative_event_path();
+ if(argc>1 && strcmp(argv[1],"--event-tap-once")==0){
+   if(argc!=4){fprintf(stderr,"USAGE: --event-tap-once X Y (normalized 0.05..0.95)\n");return 12;}
+   char *ex=NULL,*ey=NULL;
+   double x=strtod(argv[2],&ex), y=strtod(argv[3],&ey);
+   if(!ex || *ex || ex==argv[2] || !ey || *ey || ey==argv[3]){
+     puts("EVENT_TAP_REFUSED=INVALID_NUMBER"); return 12;
+   }
+   return event_test_one_tap(x,y);
+ }
+
  if(argc>1 && strcmp(argv[1],"--version")==0) {
    puts("VERSION_OK; no HID registration attempted");
    return 0;
