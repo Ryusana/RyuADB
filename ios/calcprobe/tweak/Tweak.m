@@ -1,4 +1,4 @@
-// RYU V12: Calculator-only UIKit event-delivery research.
+// RYU V13: Calculator-only UIKit event-delivery research.
 // The tweak does nothing on load except register a Darwin notification.
 // It sends exactly ONE down/up only when root sends the user-authorized request.
 // Not intended for game use, no hooking of backboardd, no physical sender spoofing.
@@ -72,8 +72,21 @@ static void ryu_send_one_tap(void) {
     }
 
     char note[160];
-    snprintf(note,sizeof(note),"ROUTE_BEGIN context=%u x=0.5 y=0.7 (Calculator only)",context);
+    snprintf(note,sizeof(note),"ROUTE_BEGIN context=%u x=0.375 y=0.700 (Calculator only, button-column center)",context);
     ryu_log(note);
+    // Previous x=0.5 was on the boundary between the two center keypad columns.
+    // Probe UIKit hit-testing before sending any event; no accessibility or private data is stored.
+    CGPoint planned = CGPointMake(CGRectGetWidth(window.bounds)*0.375,
+                                  CGRectGetHeight(window.bounds)*0.700);
+    UIView *hit = [window hitTest:planned withEvent:nil];
+    NSString *hitName = hit ? NSStringFromClass([hit class]) : @"NONE";
+    NSString *parentName = hit.superview ? NSStringFromClass([hit.superview class]) : @"NONE";
+    char hitLog[360];
+    snprintf(hitLog, sizeof(hitLog),
+             "TARGET_HIT_TEST window=%.1fx%.1f planned=%.1f,%.1f view=%s parent=%s",
+             CGRectGetWidth(window.bounds), CGRectGetHeight(window.bounds),
+             planned.x, planned.y, [hitName UTF8String], [parentName UTF8String]);
+    ryu_log(hitLog);
     // Mirrors WebKit's app-specific HID injection structure: parent hand at 0,0,
     // child finger at normalized coordinate. This is *not* the physical digitizer sender.
     const uint32_t integrated = (11u<<16) + 25u;
@@ -85,7 +98,7 @@ static void ryu_send_one_tap(void) {
         CFTypeRef hand=handfn(kCFAllocatorDefault,timestamp,3,0,0,parentMask,0,
                               0.0,0.0,0.0,0.0,0.0,touching,touching,0);
         CFTypeRef finger=fingerfn(kCFAllocatorDefault,timestamp,0x5151,0x5151,childMask,
-                                  0.5,0.7,0.0,0.0,0.0,touching,touching,0);
+                                  0.375,0.700,0.0,0.0,0.0,touching,touching,0);
         if (!hand || !finger) {
             if(hand)CFRelease(hand);
             if(finger)CFRelease(finger);
@@ -105,7 +118,7 @@ static void ryu_send_one_tap(void) {
                 CFTypeRef up=handfn(kCFAllocatorDefault,t2,3,0,0,2u,0,
                                      0.0,0.0,0.0,0.0,0.0,0,0,0);
                 CFTypeRef fup=fingerfn(kCFAllocatorDefault,t2,0x5151,0x5151,3u,
-                                        0.5,0.7,0.0,0.0,0.0,0,0,0);
+                                        0.375,0.700,0.0,0.0,0.0,0,0,0);
                 if(up && fup) {
                     setint(up,integrated,1);
                     append(up,fup,0);
@@ -134,8 +147,13 @@ static void ryu_observe_sendEvent(id receiver, SEL command, UIEvent *event) {
         }
         if (began || ended || moved) {
             char msg[180];
-            snprintf(msg,sizeof(msg),"UIKIT_TOUCH_EVENT began=%lu ended=%lu moved=%lu",
-                (unsigned long)began,(unsigned long)ended,(unsigned long)moved);
+            UITouch *sample = [event.allTouches anyObject];
+            UIWindow *win = sample.window;
+            CGPoint point = win ? [sample locationInView:win] : CGPointZero;
+            NSString *name = sample.view ? NSStringFromClass([sample.view class]) : @"NONE";
+            snprintf(msg,sizeof(msg),"UIKIT_TOUCH_EVENT began=%lu ended=%lu moved=%lu pos=%.1f,%.1f view=%.65s",
+                (unsigned long)began,(unsigned long)ended,(unsigned long)moved,
+                point.x,point.y,[name UTF8String]);
             ryu_log(msg);
         }
     }
