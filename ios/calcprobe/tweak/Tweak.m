@@ -1,4 +1,4 @@
-// RYU V13: Calculator-only UIKit event-delivery research.
+// RYU V14: Calculator-only UIKit delivery + before/after evidence.
 // The tweak does nothing on load except register a Darwin notification.
 // It sends exactly ONE down/up only when root sends the user-authorized request.
 // Not intended for game use, no hooking of backboardd, no physical sender spoofing.
@@ -41,6 +41,34 @@ static UIWindow *ryu_front_window(void) {
     return nil;
 }
 
+// Capture only the app-local Calculator window after an explicitly authorized
+// test command. No background screen recording and no other app is hooked.
+static void ryu_capture_calc(NSString *label, UIWindow *window) {
+    if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.calculator"] || !window) return;
+    CGSize size=window.bounds.size;
+    if (size.width<10 || size.height<10 || size.width>1500 || size.height>2500) {
+        ryu_log("SCREENSHOT_SKIP invalid_window_size"); return;
+    }
+    @autoreleasepool {
+        UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+        BOOL ok=[window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
+        UIImage *snapshot=ok ? UIGraphicsGetImageFromCurrentImageContext() : nil;
+        NSData *png=snapshot ? UIImagePNGRepresentation(snapshot) : nil;
+        UIGraphicsEndImageContext();
+        if (!png || png.length<100 || png.length>8000000) {
+            ryu_log("SCREENSHOT_FAIL render_or_size"); return;
+        }
+        NSString *leaf=[NSString stringWithFormat:@"RYUCalcProbe_%@.png",label];
+        NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:
+                        [@"Library/Caches" stringByAppendingPathComponent:leaf]];
+        BOOL written=[png writeToFile:path atomically:YES];
+        char message[150];
+        snprintf(message,sizeof(message),"SCREENSHOT_%s=%s bytes=%lu",[label UTF8String],
+                 written?"SAVED":"WRITE_FAILED",(unsigned long)png.length);
+        ryu_log(message);
+    }
+}
+
 static void ryu_send_one_tap(void) {
     if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.calculator"]) return;
     UIWindow *window = ryu_front_window();
@@ -71,8 +99,9 @@ static void ryu_send_one_tap(void) {
         ryu_log("ERROR REQUIRED_EVENT_SYMBOL_MISSING"); dlclose(hid);dlclose(bks);return;
     }
 
-    char note[160];
-    snprintf(note,sizeof(note),"ROUTE_BEGIN context=%u x=0.375 y=0.700 (Calculator only, button-column center)",context);
+    ryu_capture_calc(@"before", window);
+    char note[220];
+    snprintf(note,sizeof(note),"ROUTE_BEGIN context=%u coord_mode=WINDOW_POINTS norm_x=0.375 norm_y=0.700",context);
     ryu_log(note);
     // Previous x=0.5 was on the boundary between the two center keypad columns.
     // Probe UIKit hit-testing before sending any event; no accessibility or private data is stored.
@@ -87,8 +116,9 @@ static void ryu_send_one_tap(void) {
              CGRectGetWidth(window.bounds), CGRectGetHeight(window.bounds),
              planned.x, planned.y, [hitName UTF8String], [parentName UTF8String]);
     ryu_log(hitLog);
-    // Mirrors WebKit's app-specific HID injection structure: parent hand at 0,0,
-    // child finger at normalized coordinate. This is *not* the physical digitizer sender.
+    // V14: UIKit reported the earlier normalized inputs as (0.4, 0.7) points.
+    // Test window-point coordinates computed by hitTest, not 0..1 normalized values.
+    // This is an app-only research experiment; physical finger independence untested.
     const uint32_t integrated = (11u<<16) + 25u;
     {
         const unsigned char touching=1;
@@ -98,7 +128,7 @@ static void ryu_send_one_tap(void) {
         CFTypeRef hand=handfn(kCFAllocatorDefault,timestamp,3,0,0,parentMask,0,
                               0.0,0.0,0.0,0.0,0.0,touching,touching,0);
         CFTypeRef finger=fingerfn(kCFAllocatorDefault,timestamp,0x5151,0x5151,childMask,
-                                  0.375,0.700,0.0,0.0,0.0,touching,touching,0);
+                                  planned.x,planned.y,0.0,0.0,0.0,touching,touching,0);
         if (!hand || !finger) {
             if(hand)CFRelease(hand);
             if(finger)CFRelease(finger);
@@ -118,13 +148,21 @@ static void ryu_send_one_tap(void) {
                 CFTypeRef up=handfn(kCFAllocatorDefault,t2,3,0,0,2u,0,
                                      0.0,0.0,0.0,0.0,0.0,0,0,0);
                 CFTypeRef fup=fingerfn(kCFAllocatorDefault,t2,0x5151,0x5151,3u,
-                                        0.375,0.700,0.0,0.0,0.0,0,0,0);
+                                        planned.x,planned.y,0.0,0.0,0.0,0,0,0);
                 if(up && fup) {
                     setint(up,integrated,1);
                     append(up,fup,0);
                     setctx(up,context,0,0,NULL,0.0,0.0);
                     ((void(*)(id,SEL,CFTypeRef))objc_msgSend)(app,enqueue,up);
                     ryu_log("APP_ENQUEUE_UP_CALLED");
+                    // One after-frame, 240 ms after UP: observe UI visually
+                    // without opening a new app or waiting for user screenshots.
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 240000000),
+                                   dispatch_get_main_queue(), ^{
+                        UIWindow *current=ryu_front_window();
+                        if (current) ryu_capture_calc(@"after",current);
+                        else ryu_log("SCREENSHOT_after=SKIP_NO_WINDOW");
+                    });
                 }else ryu_log("ERROR UP_EVENT_CREATE_NULL");
                 if(fup)CFRelease(fup);
                 if(up)CFRelease(up);
