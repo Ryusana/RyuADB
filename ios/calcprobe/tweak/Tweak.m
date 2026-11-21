@@ -62,9 +62,12 @@ static void ryu_capture_calc(NSString *label, UIWindow *window) {
         NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:
                         [@"Library/Caches" stringByAppendingPathComponent:leaf]];
         BOOL written=[png writeToFile:path atomically:YES];
-        char message[150];
-        snprintf(message,sizeof(message),"SCREENSHOT_%s=%s bytes=%lu",[label UTF8String],
-                 written?"SAVED":"WRITE_FAILED",(unsigned long)png.length);
+        // Record exact app-sandbox file path to avoid guessing its container on Windows.
+        // The evidence collector accepts only fresh PNGs inside an app data container.
+        char message[720];
+        snprintf(message,sizeof(message),"SCREENSHOT_%s=%s bytes=%lu path=%s",[label UTF8String],
+                 written?"SAVED":"WRITE_FAILED",(unsigned long)png.length,
+                 path.fileSystemRepresentation);
         ryu_log(message);
     }
 }
