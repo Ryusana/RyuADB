@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -21,7 +22,7 @@
 #include "ryu_hid_report.h"
 
 #define RYU_PORT 6017
-#define RYU_BUILD_STAMP "P1.1-HID-DIAG-20261120"
+#define RYU_BUILD_STAMP "P1.2-KERNEL-ACCESS-AUDIT-20261121"
 // Deliberately harmless, vendor-defined HID descriptor used to isolate
 // a registration/permission problem from a touchscreen descriptor problem.
 static const uint8_t RYU_BASIC_DESCRIPTOR[] = {
@@ -48,6 +49,87 @@ static void add_str(CFMutableDictionaryRef d,const char *key,const char *value) 
   CFStringRef v=CFStringCreateWithCString(kCFAllocatorDefault,value,kCFStringEncodingUTF8);
   CFDictionarySetValue(d,k,v); CFRelease(k); CFRelease(v);
 }
+// V08: no-touch registration-layer audit. No Apple service, registry property,
+// jailbreak privilege setting, or screen event is modified. The only IOKit
+// mutation is opening and immediately closing a user client if permitted.
+typedef const struct __SecTask *RyuSecTaskRef;
+static void audit_task_entitlements(void) {
+  const char *path="/System/Library/Frameworks/Security.framework/Security";
+  void *h=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+  if(!h){printf("SECTASK_LIBRARY=UNAVAILABLE reason=dlopen_failed\n");return;}
+  RyuSecTaskRef (*task_create)(CFAllocatorRef)=(RyuSecTaskRef(*)(CFAllocatorRef))dlsym(h,"SecTaskCreateFromSelf");
+  CFTypeRef (*copy_value)(RyuSecTaskRef,CFStringRef,CFErrorRef*)=
+    (CFTypeRef(*)(RyuSecTaskRef,CFStringRef,CFErrorRef*))dlsym(h,"SecTaskCopyValueForEntitlement");
+  if(!task_create || !copy_value){printf("SECTASK_API=UNAVAILABLE\n");dlclose(h);return;}
+  RyuSecTaskRef task=task_create(kCFAllocatorDefault);
+  if(!task){printf("SECTASK_CREATE=NULL\n");dlclose(h);return;}
+  const char *keys[]={
+    "platform-application",
+    "com.apple.hid.manager.user-access-device",
+    "com.apple.developer.hid.virtual.device",
+    "com.apple.hid.system.user-access-service",
+    "com.apple.hid.system.server-access"
+  };
+  for(size_t i=0;i<sizeof(keys)/sizeof(keys[0]);i++){
+    CFStringRef key=CFStringCreateWithCString(kCFAllocatorDefault,keys[i],kCFStringEncodingUTF8);
+    CFErrorRef err=NULL;
+    CFTypeRef val=copy_value(task,key,&err);
+    if(val){
+      if(CFGetTypeID(val)==CFBooleanGetTypeID()){
+        printf("SECTASK_RIGHT %s=%s\n",keys[i],CFBooleanGetValue((CFBooleanRef)val)?"TRUE":"FALSE");
+      }else printf("SECTASK_RIGHT %s=NON_BOOLEAN\n",keys[i]);
+      CFRelease(val);
+    }else if(err){
+      printf("SECTASK_RIGHT %s=ERROR code=%ld\n",keys[i],(long)CFErrorGetCode(err));
+    }else printf("SECTASK_RIGHT %s=NOT_PRESENT\n",keys[i]);
+    if(err)CFRelease(err);
+    CFRelease(key);
+  }
+  CFRelease((CFTypeRef)task);
+  dlclose(h);
+}
+static void audit_iokit_user_client(void) {
+  void *h=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
+  if(!h){printf("IOKIT_LIBRARY=UNAVAILABLE reason=dlopen_failed\n");return;}
+  CFMutableDictionaryRef (*service_match)(const char *)=(CFMutableDictionaryRef(*)(const char *))dlsym(h,"IOServiceMatching");
+  CFMutableDictionaryRef (*name_match)(const char *)=(CFMutableDictionaryRef(*)(const char *))dlsym(h,"IOServiceNameMatching");
+  uint32_t (*get_service)(mach_port_t,CFDictionaryRef)=(uint32_t(*)(mach_port_t,CFDictionaryRef))dlsym(h,"IOServiceGetMatchingService");
+  kern_return_t (*service_open)(uint32_t,mach_port_t,uint32_t,mach_port_t*)=
+    (kern_return_t(*)(uint32_t,mach_port_t,uint32_t,mach_port_t*))dlsym(h,"IOServiceOpen");
+  kern_return_t (*service_close)(mach_port_t)=(kern_return_t(*)(mach_port_t))dlsym(h,"IOServiceClose");
+  kern_return_t (*obj_release)(uint32_t)=(kern_return_t(*)(uint32_t))dlsym(h,"IOObjectRelease");
+  if(!service_match || !get_service || !service_open || !service_close || !obj_release){
+    printf("IOKIT_REQUIRED_SYMBOLS=MISSING\n");dlclose(h);return;
+  }
+  // Published IOHIDFamily defines the only device user-client type as zero.
+  // Matching is a read-only query of IORegistry.
+  uint32_t service=get_service(MACH_PORT_NULL,service_match("IOHIDResource"));
+  if(service)printf("IOHID_RESOURCE_MATCH=CLASS_FOUND\n");
+  if(!service && name_match){
+    service=get_service(MACH_PORT_NULL,name_match("IOHIDResource"));
+    if(service)printf("IOHID_RESOURCE_MATCH=NAME_FOUND\n");
+  }
+  if(!service){printf("IOHID_RESOURCE_MATCH=NOT_FOUND\n");dlclose(h);return;}
+  mach_port_t connection=MACH_PORT_NULL;
+  kern_return_t kr=service_open(service,mach_task_self(),0,&connection);
+  printf("IOHID_RESOURCE_OPEN_RC=0x%08x\n",(unsigned)kr);
+  printf("IOHID_RESOURCE_OPEN=%s\n",kr==KERN_SUCCESS && connection!=MACH_PORT_NULL?"OK":"FAILED");
+  if(connection!=MACH_PORT_NULL){
+    kern_return_t close_rc=service_close(connection);
+    printf("IOHID_RESOURCE_CLOSE_RC=0x%08x\n",(unsigned)close_rc);
+  }
+  obj_release(service);
+  dlclose(h);
+}
+static int audit_kernel_registration(void) {
+  printf("KERNEL_AUDIT_BEGIN build=%s uid=%ld euid=%ld\n",
+      RYU_BUILD_STAMP,(long)getuid(),(long)geteuid());
+  audit_task_entitlements();
+  audit_iokit_user_client();
+  puts("KERNEL_AUDIT_END; no HID reports sent, no touch injected");
+  return 0; // diagnostic: explicit result is in structured output
+}
+
 static int load_hid(int basic) {
   iokit_handle=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW);
   if(!iokit_handle){fprintf(stderr,"ERR iokit_dl_open: %s\n",dlerror());return -1;}
@@ -139,6 +221,7 @@ int main(int argc, char **argv){
  uint8_t bytes[16]; arc4random_buf(bytes,sizeof(bytes));
  for(int i=0;i<16;i++)sprintf(secret+i*2,"%02x",bytes[i]);secret[32]=0;
  ryu_report_init(&current);
+ if(argc>1 && strcmp(argv[1],"--audit-kernel")==0) return audit_kernel_registration();
  if(argc>1 && strcmp(argv[1],"--version")==0) {
    puts("VERSION_OK; no HID registration attempted");
    return 0;
