@@ -37,9 +37,19 @@ jobs:
           gmake -C ios package FINALPACKAGE=1
           ls -lh ios/packages/*.deb
 
+      - name: Build Calculator-only UIKit route probe V12
+        shell: bash
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          gmake -C ios/calcprobe package FINALPACKAGE=1
+          ls -lh ios/calcprobe/packages/*.deb
+
       - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: RYU-iOS-rootless-P1-unverified
-          path: ios/packages/*.deb
+          name: RYU-V12-Calculator-App-Route
+          path: |
+            ios/packages/*.deb
+            ios/calcprobe/packages/*.deb
           if-no-files-found: error

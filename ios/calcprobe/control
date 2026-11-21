@@ -1,0 +1,9 @@
+Package: com.ryusana.calcprobe
+Name: RYU Calculator Touch Route Research
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: One-shot opt-in UIKit delivery probe. Calculator-only. No background touches.
+Maintainer: RYU
+Author: RYU
+Section: Development
+Depends: firmware (>= 15.0), ellekit
