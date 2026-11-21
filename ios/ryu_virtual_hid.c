@@ -22,7 +22,7 @@
 #include "ryu_hid_report.h"
 
 #define RYU_PORT 6017
-#define RYU_BUILD_STAMP "P1.3-IOKIT-TRUST-AUDIT-20261121"
+#define RYU_BUILD_STAMP "P1.4-ALT-HID-EVENT-PATH-20261121"
 // Deliberately harmless, vendor-defined HID descriptor used to isolate
 // a registration/permission problem from a touchscreen descriptor problem.
 static const uint8_t RYU_BASIC_DESCRIPTOR[] = {
@@ -181,6 +181,51 @@ static int audit_kernel_registration(void) {
   return 0; // diagnostic: explicit result is in structured output
 }
 
+
+// V10: alternate HID EVENT-SYSTEM path survey, separate from the blocked
+// IOHIDResourceDeviceUserClient. This probe NEVER creates or sends IOHIDEvents,
+// never registers a virtual HID device and never hooks backboardd.
+// A client reference or exported symbol does NOT establish event-dispatch rights.
+static int audit_alternative_event_path(void) {
+  puts("EVENT_PATH_AUDIT_BEGIN; no input generated");
+  void *h=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
+  if(!h){puts("EVENT_PATH_IOKIT=UNAVAILABLE");return 2;}
+  const char *names[]={
+    "IOHIDEventSystemClientCreate",
+    "IOHIDEventSystemClientCreateWithType",
+    "IOHIDEventSystemClientCopyServices",
+    "IOHIDEventSystemClientDispatchEvent",
+    "IOHIDVirtualServiceClientCreate",
+    "IOHIDVirtualServiceClientDispatchEvent",
+    "IOHIDEventCreateDigitizerEvent",
+    "IOHIDEventCreateDigitizerFingerEvent"
+  };
+  for(size_t i=0;i<sizeof(names)/sizeof(names[0]);++i){
+    printf("EVENT_SYMBOL %s=%s\n",names[i],dlsym(h,names[i])?"AVAILABLE":"UNAVAILABLE");
+  }
+  CFTypeRef (*create_client)(CFAllocatorRef) =
+    (CFTypeRef(*)(CFAllocatorRef))dlsym(h,"IOHIDEventSystemClientCreate");
+  CFArrayRef (*copy_services)(CFTypeRef) =
+    (CFArrayRef(*)(CFTypeRef))dlsym(h,"IOHIDEventSystemClientCopyServices");
+  if(!create_client){puts("EVENT_SYSTEM_CLIENT=SKIPPED_NO_API");dlclose(h);return 0;}
+  // Unlike IOHIDUserDeviceCreate, this is a standard HID event-system client.
+  // We open it briefly and enumerate count only; we do not dispatch a touch.
+  CFTypeRef client=create_client(kCFAllocatorDefault);
+  if(!client){puts("EVENT_SYSTEM_CLIENT=CREATE_NULL");dlclose(h);return 0;}
+  puts("EVENT_SYSTEM_CLIENT=CREATE_OK");
+  if(copy_services){
+    CFArrayRef services=copy_services(client);
+    if(services){
+      printf("EVENT_SYSTEM_SERVICES_COUNT=%ld\n",(long)CFArrayGetCount(services));
+      CFRelease(services);
+    }else puts("EVENT_SYSTEM_SERVICES=NOT_AVAILABLE");
+  }else puts("EVENT_SYSTEM_SERVICES=SKIPPED_NO_API");
+  CFRelease(client);
+  puts("EVENT_PATH_AUDIT_END; no event sent; dispatch permission UNKNOWN; finger independence UNTESTED");
+  dlclose(h);
+  return 0;
+}
+
 static int load_hid(int basic) {
   iokit_handle=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW);
   if(!iokit_handle){fprintf(stderr,"ERR iokit_dl_open: %s\n",dlerror());return -1;}
@@ -273,6 +318,7 @@ int main(int argc, char **argv){
  for(int i=0;i<16;i++)sprintf(secret+i*2,"%02x",bytes[i]);secret[32]=0;
  ryu_report_init(&current);
  if(argc>1 && strcmp(argv[1],"--audit-kernel")==0) return audit_kernel_registration();
+ if(argc>1 && strcmp(argv[1],"--audit-event-path")==0) return audit_alternative_event_path();
  if(argc>1 && strcmp(argv[1],"--version")==0) {
    puts("VERSION_OK; no HID registration attempted");
    return 0;
