@@ -1,6 +1,6 @@
 Package: com.ryu.virtualhid
 Name: RYU Virtual HID Research
-Version: 0.1.2
+Version: 0.1.3
 Architecture: iphoneos-arm64
 Description: Foreground experimental virtual digitizer research tool for jailbroken iOS. No autostart.
 Maintainer: RYU

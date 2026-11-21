@@ -22,7 +22,7 @@
 #include "ryu_hid_report.h"
 
 #define RYU_PORT 6017
-#define RYU_BUILD_STAMP "P1.2-KERNEL-ACCESS-AUDIT-20261121"
+#define RYU_BUILD_STAMP "P1.3-IOKIT-TRUST-AUDIT-20261121"
 // Deliberately harmless, vendor-defined HID descriptor used to isolate
 // a registration/permission problem from a touchscreen descriptor problem.
 static const uint8_t RYU_BASIC_DESCRIPTOR[] = {
@@ -88,6 +88,53 @@ static void audit_task_entitlements(void) {
   CFRelease((CFTypeRef)task);
   dlclose(h);
 }
+// V09: query kernel code-signing state via csops(2). This does not alter flags.
+// SecTask entitlement visibility alone does not tell us CS_PLATFORM_BINARY.
+static void audit_kernel_codesign_state(void) {
+  typedef int (*ryu_csops_fn)(pid_t,unsigned int,void*,size_t);
+  ryu_csops_fn csops_fn=(ryu_csops_fn)dlsym(RTLD_DEFAULT,"csops");
+  void *lib=NULL;
+  if(!csops_fn){
+    lib=dlopen("/usr/lib/system/libsystem_kernel.dylib",RTLD_NOW|RTLD_LOCAL);
+    if(lib)csops_fn=(ryu_csops_fn)dlsym(lib,"csops");
+  }
+  if(!csops_fn){puts("CSOPS_STATUS=SYMBOL_UNAVAILABLE");if(lib)dlclose(lib);return;}
+  uint32_t flags=0;
+  errno=0;
+  int rc=csops_fn(getpid(),0,&flags,sizeof(flags)); // CS_OPS_STATUS = 0
+  if(rc!=0){printf("CSOPS_STATUS=FAILED errno=%d\n",errno);if(lib)dlclose(lib);return;}
+  printf("CSOPS_FLAGS=0x%08x\n",flags);
+  printf("CSOPS_CS_VALID=%s\n",(flags & 0x00000001u)?"TRUE":"FALSE");
+  printf("CSOPS_CS_ADHOC=%s\n",(flags & 0x00000002u)?"TRUE":"FALSE");
+  printf("CSOPS_CS_PLATFORM_BINARY=%s\n",(flags & 0x04000000u)?"TRUE":"FALSE");
+  printf("CSOPS_CS_PLATFORM_PATH=%s\n",(flags & 0x08000000u)?"TRUE":"FALSE");
+  printf("CSOPS_CS_DEBUGGED=%s\n",(flags & 0x10000000u)?"TRUE":"FALSE");
+  printf("CSOPS_CS_SIGNED=%s\n",(flags & 0x20000000u)?"TRUE":"FALSE");
+  if(lib)dlclose(lib);
+}
+
+// V09: print only a narrow whitelist of published IORegistry properties.
+// No IORegistry property is changed; no user client is instantiated by this helper.
+static void audit_hid_resource_registry(void *lib, uint32_t service) {
+  CFTypeRef (*copyprop)(uint32_t,CFStringRef,CFAllocatorRef,uint32_t)=
+    (CFTypeRef(*)(uint32_t,CFStringRef,CFAllocatorRef,uint32_t))dlsym(lib,"IORegistryEntryCreateCFProperty");
+  if(!copyprop){puts("IOREG_PROPERTY_API=UNAVAILABLE");return;}
+  const char *keys[]={"IOUserClientClass","IOUserClientEntitlements","IOClass","IOProviderClass"};
+  for(size_t i=0;i<sizeof(keys)/sizeof(keys[0]);++i){
+    CFStringRef key=CFStringCreateWithCString(kCFAllocatorDefault,keys[i],kCFStringEncodingUTF8);
+    if(!key){continue;}
+    CFTypeRef p=copyprop(service,key,kCFAllocatorDefault,0);
+    if(!p){printf("IOREG_PROP %s=NOT_PRESENT\n",keys[i]);CFRelease(key);continue;}
+    if(CFGetTypeID(p)==CFStringGetTypeID()){
+      char buf[256]={0};
+      if(CFStringGetCString((CFStringRef)p,buf,sizeof(buf),kCFStringEncodingUTF8))
+        printf("IOREG_PROP %s=%s\n",keys[i],buf);
+      else printf("IOREG_PROP %s=STRING_CONVERSION_FAILED\n",keys[i]);
+    }else printf("IOREG_PROP %s=NON_STRING_TYPE\n",keys[i]);
+    CFRelease(p); CFRelease(key);
+  }
+}
+
 static void audit_iokit_user_client(void) {
   void *h=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
   if(!h){printf("IOKIT_LIBRARY=UNAVAILABLE reason=dlopen_failed\n");return;}
@@ -110,9 +157,12 @@ static void audit_iokit_user_client(void) {
     if(service)printf("IOHID_RESOURCE_MATCH=NAME_FOUND\n");
   }
   if(!service){printf("IOHID_RESOURCE_MATCH=NOT_FOUND\n");dlclose(h);return;}
+  audit_hid_resource_registry(h,service);
+  puts("IOHID_RESOURCE_OPEN_TYPE=0"); // published IOHIDResourceDeviceUserClient connection type
   mach_port_t connection=MACH_PORT_NULL;
   kern_return_t kr=service_open(service,mach_task_self(),0,&connection);
   printf("IOHID_RESOURCE_OPEN_RC=0x%08x\n",(unsigned)kr);
+  if((uint32_t)kr==0xe00002e2u)puts("IOHID_RESOURCE_OPEN_REASON=kIOReturnNotPermitted");
   printf("IOHID_RESOURCE_OPEN=%s\n",kr==KERN_SUCCESS && connection!=MACH_PORT_NULL?"OK":"FAILED");
   if(connection!=MACH_PORT_NULL){
     kern_return_t close_rc=service_close(connection);
@@ -125,6 +175,7 @@ static int audit_kernel_registration(void) {
   printf("KERNEL_AUDIT_BEGIN build=%s uid=%ld euid=%ld\n",
       RYU_BUILD_STAMP,(long)getuid(),(long)geteuid());
   audit_task_entitlements();
+  audit_kernel_codesign_state();
   audit_iokit_user_client();
   puts("KERNEL_AUDIT_END; no HID reports sent, no touch injected");
   return 0; // diagnostic: explicit result is in structured output
